@@ -2,6 +2,7 @@ package cache
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
 	"runtime"
 	"strconv"
@@ -13,6 +14,44 @@ import (
 type TestStruct struct {
 	Num      int
 	Children []*TestStruct
+}
+
+func TestCacheRefreshBulk(t *testing.T) {
+	tc := New(DefaultExpiration, 0).WithRefreshStrategy(time.Second*2, func(key string) (interface{}, error) {
+		return 100, nil
+	})
+
+	for i := 0; i < 1100; i++ {
+		tc.SetDefault(fmt.Sprintf("%d", i), 1)
+	}
+	time.Sleep(time.Second * 3)
+	for i := 0; i < 1100; i++ {
+		tc.Get(fmt.Sprintf("%d", i))
+	}
+}
+
+func TestCacheRefresh(t *testing.T) {
+	tc := New(DefaultExpiration, 0).WithRefreshStrategy(time.Second*2, func(key string) (interface{}, error) {
+		return 100, nil
+	})
+
+	a, found := tc.Get("a")
+	if found || a != nil {
+		t.Error("Getting A found value that shouldn't exist:", a)
+	}
+
+	tc.SetDefault("a", 1)
+	time.Sleep(time.Second * 3)
+	a, found = tc.Get("a")
+	if found && a != 1 {
+		t.Error("Getting A found value that should be 1:", a)
+	}
+
+	time.Sleep(time.Second * 1)
+	a, found = tc.Get("a")
+	if found && a != 100 {
+		t.Error("Getting A found value that should be 100:", a)
+	}
 }
 
 func TestCache(t *testing.T) {
@@ -107,12 +146,12 @@ func TestCacheTimes(t *testing.T) {
 }
 
 func TestNewFrom(t *testing.T) {
-	m := map[string]Item{
-		"a": Item{
+	m := map[string]*Item{
+		"a": &Item{
 			Object:     1,
 			Expiration: 0,
 		},
-		"b": Item{
+		"b": &Item{
 			Object:     2,
 			Expiration: 0,
 		},

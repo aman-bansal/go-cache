@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"runtime"
 	"sync"
@@ -13,14 +14,21 @@ import (
 type Item struct {
 	Object     interface{}
 	Expiration int64
+	RefreshTs  int64
+	Refreshed  bool
 }
 
 // Returns true if the item has expired.
-func (item Item) Expired() bool {
+func (item *Item) Expired() bool {
 	if item.Expiration == 0 {
 		return false
 	}
 	return time.Now().UnixNano() > item.Expiration
+}
+
+// Returns true if the item has expired.
+func (item *Item) SetRefreshed() {
+	item.Refreshed = true
 }
 
 const (
@@ -37,11 +45,25 @@ type Cache struct {
 	// If this is confusing, see the comment at the bottom of New()
 }
 
+type refreshKey struct {
+	key            string
+	expiryTs       int64
+	expiryDuration time.Duration
+}
+
+type refresher struct {
+	refreshDuration time.Duration
+	refreshCh       chan refreshKey
+	refreshFunction func(string) (interface{}, error) // refresh function to call for the key
+	close           chan bool
+}
+
 type cache struct {
 	defaultExpiration time.Duration
-	items             map[string]Item
+	items             map[string]*Item
 	mu                sync.RWMutex
 	onEvicted         func(string, interface{})
+	refresher         *refresher
 	janitor           *janitor
 }
 
@@ -58,9 +80,10 @@ func (c *cache) Set(k string, x interface{}, d time.Duration) {
 		e = time.Now().Add(d).UnixNano()
 	}
 	c.mu.Lock()
-	c.items[k] = Item{
+	c.items[k] = &Item{
 		Object:     x,
 		Expiration: e,
+		RefreshTs:  c.getNextRefreshTs(),
 	}
 	// TODO: Calls to mu.Unlock are currently not deferred because defer
 	// adds ~200 ns (as of go1.)
@@ -75,9 +98,10 @@ func (c *cache) set(k string, x interface{}, d time.Duration) {
 	if d > 0 {
 		e = time.Now().Add(d).UnixNano()
 	}
-	c.items[k] = Item{
+	c.items[k] = &Item{
 		Object:     x,
 		Expiration: e,
+		RefreshTs:  c.getNextRefreshTs(),
 	}
 }
 
@@ -132,6 +156,7 @@ func (c *cache) Get(k string) (interface{}, bool) {
 		}
 	}
 	c.mu.RUnlock()
+	c.refresh(k, item)
 	return item.Object, true
 }
 
@@ -156,12 +181,14 @@ func (c *cache) GetWithExpiration(k string) (interface{}, time.Time, bool) {
 
 		// Return the item and the expiration time
 		c.mu.RUnlock()
+		c.refresh(k, item)
 		return item.Object, time.Unix(0, item.Expiration), true
 	}
 
 	// If expiration <= 0 (i.e. no expiration time set) then return the item
 	// and a zeroed time.Time
 	c.mu.RUnlock()
+	c.refresh(k, item)
 	return item.Object, time.Time{}, true
 }
 
@@ -1001,7 +1028,7 @@ func (c *cache) SaveFile(fname string) error {
 // documentation for NewFrom().)
 func (c *cache) Load(r io.Reader) error {
 	dec := gob.NewDecoder(r)
-	items := map[string]Item{}
+	items := map[string]*Item{}
 	err := dec.Decode(&items)
 	if err == nil {
 		c.mu.Lock()
@@ -1035,10 +1062,10 @@ func (c *cache) LoadFile(fname string) error {
 }
 
 // Copies all unexpired items in the cache into a new map and returns it.
-func (c *cache) Items() map[string]Item {
+func (c *cache) Items() map[string]*Item {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	m := make(map[string]Item, len(c.items))
+	m := make(map[string]*Item, len(c.items))
 	now := time.Now().UnixNano()
 	for k, v := range c.items {
 		// "Inlining" of Expired
@@ -1064,8 +1091,15 @@ func (c *cache) ItemCount() int {
 // Delete all items from the cache.
 func (c *cache) Flush() {
 	c.mu.Lock()
-	c.items = map[string]Item{}
+	c.items = map[string]*Item{}
 	c.mu.Unlock()
+}
+
+func (c *cache) getNextRefreshTs() int64 {
+	if c.refresher == nil {
+		return 0
+	}
+	return time.Now().UnixNano() + c.refresher.refreshDuration.Nanoseconds()
 }
 
 type janitor struct {
@@ -1086,8 +1120,11 @@ func (j *janitor) Run(c *cache) {
 	}
 }
 
-func stopJanitor(c *Cache) {
+func closeCache(c *Cache) {
 	c.janitor.stop <- true
+	if c.refresher != nil {
+		c.refresher.close <- true
+	}
 }
 
 func runJanitor(c *cache, ci time.Duration) {
@@ -1099,7 +1136,7 @@ func runJanitor(c *cache, ci time.Duration) {
 	go j.Run(c)
 }
 
-func newCache(de time.Duration, m map[string]Item) *cache {
+func newCache(de time.Duration, m map[string]*Item) *cache {
 	if de == 0 {
 		de = -1
 	}
@@ -1110,7 +1147,56 @@ func newCache(de time.Duration, m map[string]Item) *cache {
 	return c
 }
 
-func newCacheWithJanitor(de time.Duration, ci time.Duration, m map[string]Item) *Cache {
+func (c *cache) refresh(key string, item *Item) {
+	if c.refresher == nil {
+		return
+	}
+	c.refreshWithExpiry(key, item, c.defaultExpiration)
+}
+
+func (c *cache) refreshWithExpiry(key string, item *Item, expiry time.Duration) {
+	if item.RefreshTs < time.Now().UnixNano() && !item.Refreshed {
+		item.SetRefreshed()
+		c.refresher.refreshCh <- refreshKey{
+			key:            key,
+			expiryTs:       item.Expiration,
+			expiryDuration: expiry,
+		}
+	}
+}
+
+func (c *cache) runRefresher() {
+	for {
+		select {
+		case <-c.refresher.close:
+			close(c.refresher.refreshCh)
+			return
+		case rk := <-c.refresher.refreshCh:
+			if rk.expiryTs == 0 || time.Now().UnixNano() < rk.expiryTs {
+				value, err := c.refresher.refreshFunction(rk.key)
+				if err != nil {
+					log.Println("got the error from refresh function as ", err)
+					continue
+				}
+				c.Set(rk.key, value, rk.expiryDuration)
+			}
+		}
+	}
+}
+
+func (c *cache) WithRefreshStrategy(refreshInterval time.Duration, refreshFunc func(string) (interface{}, error)) *cache {
+	c.refresher = &refresher{
+		refreshDuration: refreshInterval,
+		refreshCh:       make(chan refreshKey, 1000),
+		refreshFunction: refreshFunc,
+		close:           make(chan bool),
+	}
+
+	go c.runRefresher()
+	return c
+}
+
+func newCacheWithJanitor(de time.Duration, ci time.Duration, m map[string]*Item) *Cache {
 	c := newCache(de, m)
 	// This trick ensures that the janitor goroutine (which--granted it
 	// was enabled--is running DeleteExpired on c forever) does not keep
@@ -1120,7 +1206,7 @@ func newCacheWithJanitor(de time.Duration, ci time.Duration, m map[string]Item) 
 	C := &Cache{c}
 	if ci > 0 {
 		runJanitor(c, ci)
-		runtime.SetFinalizer(C, stopJanitor)
+		runtime.SetFinalizer(C, closeCache)
 	}
 	return C
 }
@@ -1131,7 +1217,7 @@ func newCacheWithJanitor(de time.Duration, ci time.Duration, m map[string]Item) 
 // manually. If the cleanup interval is less than one, expired items are not
 // deleted from the cache before calling c.DeleteExpired().
 func New(defaultExpiration, cleanupInterval time.Duration) *Cache {
-	items := make(map[string]Item)
+	items := make(map[string]*Item)
 	return newCacheWithJanitor(defaultExpiration, cleanupInterval, items)
 }
 
@@ -1156,6 +1242,6 @@ func New(defaultExpiration, cleanupInterval time.Duration) *Cache {
 // gob.Register() the individual types stored in the cache before encoding a
 // map retrieved with c.Items(), and to register those same types before
 // decoding a blob containing an items map.
-func NewFrom(defaultExpiration, cleanupInterval time.Duration, items map[string]Item) *Cache {
+func NewFrom(defaultExpiration, cleanupInterval time.Duration, items map[string]*Item) *Cache {
 	return newCacheWithJanitor(defaultExpiration, cleanupInterval, items)
 }
